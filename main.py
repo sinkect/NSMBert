@@ -22,7 +22,6 @@ PAD_TOKEN = SEP_TOKEN + 1
 codebook_size = PAD_TOKEN + 1
 
 
-
 def audiofile_to_tokens(filepath):
     audio = AudioSegment.from_file(filepath)
     samples = np.array(audio.get_array_of_samples()).astype(np.float32) / (2 ** 15)
@@ -271,6 +270,8 @@ if __name__ == "__main__":
                 print(f"Error processing {filename}: {e}")
     token_cache_dir = "token_cache"
     batch_tokenize_and_save_parallel(audio_path_list, token_cache_dir, num_workers=10)
+
+    # positive pairs : negative pairs = 1 : 2
     positive_pairs = process_positive_pair(audio_path_list)
     negative_pairs = process_negative_pair(audio_path_list, len(audio_path_list) * 2)
 
