@@ -1,7 +1,7 @@
 import os
 import time
 from multiprocessing import Pool
-
+import random
 import seaborn as sns
 import numpy as np
 from matplotlib import pyplot as plt
@@ -14,7 +14,7 @@ import network
 from tqdm import tqdm
 
 encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")
-processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+processor = AutoProcessor.from_pretrained("facebook/encodec_24khz", use_fast=False)
 sampling_rate = processor.sampling_rate  # 24000
 CLS_TOKEN = 1024
 SEP_TOKEN = CLS_TOKEN + 1
@@ -22,7 +22,7 @@ PAD_TOKEN = SEP_TOKEN + 1
 codebook_size = PAD_TOKEN + 1
 
 
-# 2. tokenize function
+
 def audiofile_to_tokens(filepath):
     audio = AudioSegment.from_file(filepath)
     samples = np.array(audio.get_array_of_samples()).astype(np.float32) / (2 ** 15)
@@ -107,7 +107,7 @@ class NspTokenDataset(torch.utils.data.Dataset):
 
     def load_token(self, path):
         base = os.path.splitext(os.path.basename(path))[0]
-        return torch.load(os.path.join(self.token_cache_dir, base + ".pt"))
+        return torch.load(os.path.join(self.token_cache_dir, base + ".pt"), weights_only=True)
 
     def __getitem__(self, idx):
         file1, file2 = self.pairs[idx]
@@ -156,6 +156,26 @@ def custom_collate_fn(batch):
     return tokens_batch, labels_batch, attention_masks_batch
 
 
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, valid_loss):
+        if self.best_loss is None:
+            self.best_loss = valid_loss
+        elif valid_loss < self.best_loss - self.min_delta:
+            self.best_loss = valid_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+
 def train(
         model,
         train_loader,
@@ -163,16 +183,16 @@ def train(
         optimizer,
         criterion=nn.BCEWithLogitsLoss(),
         num_epochs=10,
-        device=torch.device("mps")
+        device=torch.device("mps"),
+        early_stopping_patience=3
 ):
     train_loss_list = []
     valid_loss_list = []
-
+    early_stopping = EarlyStopping(patience=early_stopping_patience)
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         for i, (inputs, labels, attention_masks) in enumerate(train_loader):
-
             inputs = inputs.to(device)
             labels = labels.to(device).float().unsqueeze(1)
             attention_masks = attention_masks.to(device)
@@ -203,7 +223,10 @@ def train(
         valid_loss_list.append(avg_valid_loss)
 
         print(f"Epoch {epoch + 1}: train loss {avg_train_loss:.4f}, valid loss {avg_valid_loss:.4f}")
-
+        early_stopping(avg_valid_loss)
+        if early_stopping.early_stop:
+            print(f"Early stopping at epoch {epoch + 1} (no improvement in {early_stopping.patience} epochs)")
+            break
     return train_loss_list, valid_loss_list
 
 
@@ -249,11 +272,7 @@ if __name__ == "__main__":
     token_cache_dir = "token_cache"
     batch_tokenize_and_save_parallel(audio_path_list, token_cache_dir, num_workers=10)
     positive_pairs = process_positive_pair(audio_path_list)
-    negative_pairs = process_negative_pair(audio_path_list, len(audio_path_list) // 2)
-
-    print(f"Positive pairs: {positive_pairs} \n Negative pairs: {negative_pairs}")
-
-    import random
+    negative_pairs = process_negative_pair(audio_path_list, len(audio_path_list) * 2)
 
     all_pairs = positive_pairs + negative_pairs
     all_labels = [1] * len(positive_pairs) + [0] * len(negative_pairs)
