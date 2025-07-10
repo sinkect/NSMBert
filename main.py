@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import network
 from tqdm import tqdm
+import glob
 
 encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz")
 processor = AutoProcessor.from_pretrained("facebook/encodec_24khz", use_fast=False)
@@ -183,12 +184,14 @@ def train(
         criterion=nn.BCEWithLogitsLoss(),
         num_epochs=10,
         device=torch.device("mps"),
-        early_stopping_patience=3
+        early_stopping_patience=3,
+        start_epoch=0,  # 추가!
+        checkpoint_path_template="nsp_checkpoint_epoch{}.pth"  # 추가!
 ):
     train_loss_list = []
     valid_loss_list = []
     early_stopping = EarlyStopping(patience=early_stopping_patience)
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch,num_epochs):
         model.train()
         running_loss = 0.0
         for i, (inputs, labels, attention_masks) in enumerate(train_loader):
@@ -202,11 +205,17 @@ def train(
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-
+            print("Batch", i + 1, "/", len(train_loader), "loss:", loss.item(), end="\r", flush=True)
+            if torch.isnan(loss):
+                print(f"Batch {i + 1}: NaN detected! Debug info ↓")
+                print("inputs", inputs)
+                print("labels", labels)
+                print("output", output)
+                exit(1)
         avg_train_loss = running_loss / len(train_loader)
         train_loss_list.append(avg_train_loss)
 
-        # Validation (at end of each epoch)
+        # Validation (at the end of each epoch)
         model.eval()
         valid_running_loss = 0.0
         with torch.no_grad():
@@ -222,6 +231,16 @@ def train(
         valid_loss_list.append(avg_valid_loss)
 
         print(f"Epoch {epoch + 1}: train loss {avg_train_loss:.4f}, valid loss {avg_valid_loss:.4f}")
+        save_path = checkpoint_path_template.format(epoch + 1)
+        torch.save({
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_loss_list": train_loss_list,
+            "valid_loss_list": valid_loss_list,
+        }, save_path)
+        print(f">>> Saved checkpoint at {save_path}")
+
         early_stopping(avg_valid_loss)
         if early_stopping.early_stop:
             print(f"Early stopping at epoch {epoch + 1} (no improvement in {early_stopping.patience} epochs)")
@@ -271,7 +290,7 @@ if __name__ == "__main__":
     token_cache_dir = "token_cache"
     batch_tokenize_and_save_parallel(audio_path_list, token_cache_dir, num_workers=10)
 
-    # positive pairs : negative pairs = 1 : 2
+    # positive pairs: negative pairs = 1: 2
     positive_pairs = process_positive_pair(audio_path_list)
     negative_pairs = process_negative_pair(audio_path_list, len(audio_path_list) * 2)
 
@@ -313,16 +332,30 @@ if __name__ == "__main__":
     model = network.TransitionBERT(codebook_size=codebook_size, embed_dim=512, num_layers=4, num_heads=4,
                                    max_length=2258)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    train_loss_list, valid_loss_list = train(model=model, optimizer=optimizer, train_loader=train_loader,
-                                             valid_loader=valid_loader, num_epochs=10, device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-    epochs = range(1, 11)
-    plt.plot(epochs, train_loss_list, label="train loss")
-    plt.plot(epochs, valid_loss_list, label="valid loss")
+    checkpoints = sorted(glob.glob("nsp_checkpoint_epoch*.pth"))
+    latest_checkpoint = None
+    last_epoch = 0
+    if checkpoints:
+        latest_checkpoint = checkpoints[-1]
+        print(f"Loading checkpoint: {latest_checkpoint}")
+        ckpt = torch.load(latest_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        last_epoch = ckpt["epoch"]
+        train_loss_list = ckpt.get("train_loss_list", [])
+        valid_loss_list = ckpt.get("valid_loss_list", [])
+
+    train_loss_list, valid_loss_list = train(model=model, optimizer=optimizer, train_loader=train_loader,
+                                             valid_loader=valid_loader, num_epochs=10, device=device,start_epoch=last_epoch,checkpoint_path_template="nsp_checkpoint_epoch{}.pth")
+
+    torch.save(model.state_dict(), "nsp_checkpoint.pth")
+    evaluate(model, test_loader, device)
+    plt.plot(range(1, len(train_loss_list) + 1), train_loss_list, label="train loss")
+    plt.plot(range(1, len(valid_loss_list) + 1), valid_loss_list, label="valid loss")
     plt.xlabel("epoch")
     plt.ylabel("loss")
     plt.legend()
     plt.show()
     evaluate(model, test_loader, device)
-    torch.save(model.state_dict(), "nsp_checkpoint.pth")
